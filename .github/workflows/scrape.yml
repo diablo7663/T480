@@ -1,0 +1,108 @@
+name: Scrape avito.ma
+
+on:
+  workflow_dispatch:
+    inputs:
+      detail_workers:
+        description: "Parallel detail-page requests (lower = gentler on avito.ma)"
+        default: "3"
+      detail_delay:
+        description: "Seconds to wait before each detail request"
+        default: "0.5"
+      max_details:
+        description: "Fetch at most N uncached detail pages (0 = all remaining)"
+        default: "0"
+  schedule:
+    # Nightly top-up of fresh listings; the search feed changes constantly.
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: avito-scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore crawl cache
+        run: |
+          for pack in data/cache/*.tar.gz; do
+            [ -e "$pack" ] || continue
+            echo "unpacking $pack"
+            tar -xzf "$pack" -C data
+          done
+          echo "cached pages:   $(ls data/pages 2>/dev/null | wc -l)"
+          echo "cached details: $(ls data/details 2>/dev/null | wc -l)"
+
+      - name: Scrape
+        env:
+          DETAIL_WORKERS: ${{ inputs.detail_workers || '3' }}
+          DETAIL_DELAY: ${{ inputs.detail_delay || '0.5' }}
+          MAX_DETAILS: ${{ inputs.max_details || '0' }}
+        run: |
+          python3 scraper.py \
+            --export-only \
+            --detail-workers "$DETAIL_WORKERS" \
+            --detail-delay "$DETAIL_DELAY" \
+            --max-details "$MAX_DETAILS"
+
+      - name: Re-run to mop up rate-limited pages
+        run: |
+          for attempt in 1 2 3; do
+            echo "=== mop-up pass $attempt ==="
+            python3 scraper.py --export-only --skip-details || break
+          done
+
+      - name: Report essentials coverage
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          records = json.loads(pathlib.Path("data/avito_cars.json").read_text())
+          total = len(records) or 1
+          with_detail = sum(1 for r in records if r.get("detail_labels"))
+          print(f"listings:            {total}")
+          print(f"with detail page:    {with_detail} ({100 * with_detail / total:.1f} %)")
+          for field in ("brand", "model", "year", "price"):
+              filled = sum(1 for r in records
+                           if (r.get("other_params") or {}).get(field)
+                           or r.get(field))
+              print(f"{field:20} {filled} ({100 * filled / total:.1f} %)")
+          PY
+
+      - name: Upload workbook
+        uses: actions/upload-artifact@v4
+        with:
+          name: avito_cars
+          path: |
+            data/avito_cars.xlsx
+            data/avito_cars.csv
+          retention-days: 30
+
+      - name: Commit cache + exports back
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tar -czf data/cache/pages.tar.gz -C data pages
+          tar -czf data/cache/details.tar.gz -C data details
+          git add -A data/cache
+          if git diff --staged --quiet; then
+            echo "cache unchanged"
+          else
+            git commit -m "chore: refresh scrape cache from Actions"
+            git push
+          fi

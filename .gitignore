@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+# Raw crawl artefacts: large, regenerable, and restored from data/cache/*.tar.gz
+data/pages/
+data/details/
+data/*.log
+data/avito_cars.json
+data/avito_cars.csv
+data/*.xlsx
