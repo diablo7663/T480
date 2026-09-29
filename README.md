@@ -50,15 +50,46 @@ completed page.
 ## Output
 
 - `data/pages/page_XXXX.json` — one file per result page (raw extracted ads)
+- `data/details/<list_id>.json` — one file per listing's detail page
 - `data/progress.json` — resume state
 - `data/avito_cars.json` — all unique listings, with `images[]` lists
 - `data/avito_cars.csv` — flat table (UTF-8 BOM, Excel-friendly)
+- `data/avito_cars.xlsx` — `Résumé` (KPIs, top brands/cities, field coverage)
+  plus `Annonces`: one row per car
 
 Fields per listing: id, list_id, url, title, description, category,
 ad_type, price, currency, monthly_payment, old_price, year, mileage_km,
 fuel, gearbox, extra params, location, city/area ids, date posted,
 seller (name/type/phone/verified), and flags like `is_professional`,
 `is_premium`, `is_urgent`, `is_car_checked`, plus all photo URLs.
+
+### Essentials
+
+Every car row leads with **Marque, Modèle, Année, Prix**, then the extras.
+They are filled in this order of preference:
+
+1. the listing's detail page (authoritative),
+2. inferred from the title (`infer_brand_model`) for brand/model,
+3. scraped from the description text (`price_from_text`) when a dealer hides
+   the price.
+
+`Origine du prix` records which path a price came from: `annonce`, `detail`
+or `description`; empty when the ad really has no price.
+
+## GitHub Actions
+
+`.github/workflows/scrape.yml` runs the crawl on GitHub's runners. The raw
+caches are too big to commit, so only the packed `data/cache/*.tar.gz` is
+tracked — the job unpacks them and resumes wherever the previous run stopped.
+
+- **Run now:** Actions → *Scrape avito.ma* → *Run workflow* (tune
+  `detail_workers`, `detail_delay`, `max_details`).
+- **Nightly:** `schedule` tops up new listings automatically.
+- Each run downloads `avito_cars.xlsx` + `avito_cars.csv` as an artifact and
+  commits the refreshed cache back to the repo.
+
+Concurrency is kept low (3 workers, 0.5 s apart) with `Retry-After`-aware
+backoff and jitter, because avito.ma answers bursts with HTTP 429.
 
 ## Notes
 

@@ -101,6 +101,36 @@ BRAND_DISPLAY = {
 # Model names made of two words, so "Range Rover" is not cut down to "Range".
 MODEL_PHRASES = ["range rover", "land cruiser", "al mercedes", "series 3"]
 
+# Roughly 4 800 dealers hide the price behind "prix à discuter". Most of those
+# ads still spell the number out in the description, so recover it from there.
+PRICE_MIN = 5_000
+PRICE_MAX = 20_000_000
+_PRICE_CURRENCY = re.compile(
+    r"(\d[\d\s .,]{2,14})\s*(?:dh|dhmd|dhs|mad|dirhams?)\b", re.I)
+_PRICE_WORDED = re.compile(
+    r"(?:prix|prix[st]*\s*:|vendu|vendre|le\s+vend)\D{0,15}?"
+    r"(\d[\d\s .,]{2,14})", re.I)
+
+
+def _clean_amount(match):
+    digits = re.sub(r"[^\d]", "", match)
+    return int(digits) if digits else None
+
+
+def price_from_text(text):
+    """Pull a price out of free text, ignoring years / mileages / phone numbers."""
+    if not text:
+        return None
+    for pattern in (_PRICE_CURRENCY, _PRICE_WORDED):
+        for match in pattern.finditer(text):
+            amount = _clean_amount(match.group(1))
+            if amount is None or not PRICE_MIN <= amount <= PRICE_MAX:
+                continue
+            if 1900 <= amount <= 2035:  # a year, not a price
+                continue
+            return amount
+    return None
+
 
 
 def numeric(value):
@@ -413,6 +443,8 @@ def _merge_details(output_dir, records):
     for rec in records:
         labels = dict(rec.get("detail_labels") or {})
         params = dict(rec.get("other_params") or {})
+        # "annonce" = listed on the search card, "detail" = only on the ad page.
+        rec["price_source"] = "annonce" if rec.get("price") else None
         if details_dir.exists() and rec.get("list_id"):
             path = details_dir / f"{rec['list_id']}.json"
             if path.exists():
@@ -428,6 +460,7 @@ def _merge_details(output_dir, records):
                     if not rec.get("price") and blob.get("detail_price"):
                         rec["price"] = blob["detail_price"]
                         rec["currency"] = rec.get("currency") or "DH"
+                        rec["price_source"] = "detail"
                     if not rec.get("seller_phone") and blob.get("phone"):
                         rec["seller_phone"] = blob["phone"]
                     for field in DETAIL_EXTRA_FIELDS:
@@ -444,6 +477,14 @@ def _merge_details(output_dir, records):
             params["model"] = guessed_model
         if params.get("model"):
             labels.setdefault("model", "Modèle")
+
+        # Dealers often withhold the price; recover it from the description.
+        if not rec.get("price"):
+            text_price = price_from_text(rec.get("description"))
+            if text_price:
+                rec["price"] = text_price
+                rec["currency"] = rec.get("currency") or "DH"
+                rec["price_source"] = "description"
 
         rec["brand"] = params["brand"]
         rec["other_params"] = params
@@ -601,6 +642,31 @@ EXCEL_ESSENTIAL_LABELS = {
     "brand": "Marque", "model": "Modèle", "year": "Année", "price": "Prix",
 }
 
+# French headers for the fixed columns, so the whole sheet reads consistently.
+EXCEL_COLUMN_LABELS = {
+    "id": "ID", "list_id": "ID annonce", "url": "Lien", "title": "Titre",
+    "description": "Description", "category": "Catégorie",
+    "ad_type": "Type d'annonce", "currency": "Devise",
+    "monthly_payment": "Mensualité", "old_price": "Ancien prix",
+    "mileage_km": "Kilométrage (km)", "fuel": "Carburant",
+    "gearbox": "Boîte de vitesses", "location": "Ville", "city_id": "ID ville",
+    "area_id": "ID région", "date_posted": "Publication",
+    "price_source": "Origine du prix", "seller_id": "ID vendeur",
+    "seller_type": "Type de vendeur", "seller_name": "Vendeur",
+    "seller_phone": "Téléphone", "seller_phone_verified": "Téléphone validé",
+    "seller_verified": "Vendeur validé", "is_professional": "Professionnel",
+    "is_premium": "Premium", "is_urgent": "Urgent", "is_hot_deal": "Bon plan",
+    "is_shop": "Boutique", "is_car_checked": "Voiture vérifiée",
+    "is_delivery": "Livraison", "is_highlighted": "Mis en avant",
+    "is_immoneuf": "Immoneuf", "discount": "Remise", "has_shipping": "Expédition",
+    "is_ecommerce": "E-commerce", "default_image": "Image principale",
+    "image_count": "Nombre de photos", "images_json": "Toutes les photos",
+    "date_posted_exact": "Date exacte", "video_count": "Nombre de vidéos",
+    "phone_hidden": "Téléphone masqué", "phone_verified": "Téléphone validé (fiche)",
+    "seller_address": "Adresse", "seller_website": "Site web",
+    "seller_badges": "Badges", "seller_listings": "Annonces du vendeur",
+}
+
 EXCEL_IDENTITY_COLUMNS = ["id", "list_id", "url", "title"]
 
 EXCEL_CORE_COLUMNS = [
@@ -609,7 +675,8 @@ EXCEL_CORE_COLUMNS = [
 ]
 
 EXCEL_TAIL_COLUMNS = [
-    "location", "city_id", "area_id", "date_posted", "seller_id", "seller_type",
+    "location", "city_id", "area_id", "date_posted", "price_source",
+    "seller_id", "seller_type",
     "seller_name", "seller_phone", "seller_phone_verified", "seller_verified",
     "is_professional", "is_premium", "is_urgent", "is_hot_deal", "is_shop",
     "is_car_checked", "is_delivery", "is_highlighted", "is_immoneuf",
@@ -792,15 +859,17 @@ def export_excel(records, path):
     for rec in records:
         for key, label in (rec.get("detail_labels") or {}).items():
             labels.setdefault(key, label)
-    # brand/model live in other_params but are essentials, so they are read
-    # from there too and get the same French headers.
     param_set = set(param_cols) | {"brand", "model"}
     headers = []
     for name in columns:
         if name in param_set:
-            header = EXCEL_ESSENTIAL_LABELS.get(name) or labels.get(name, name)
+            # brand/model live in other_params but are essentials, so they are
+            # read from there too and carry the same French header.
+            header = labels.get(name) or name
         else:
             header = name
+        header = (EXCEL_ESSENTIAL_LABELS.get(name)
+                  or EXCEL_COLUMN_LABELS.get(name, header))
         candidate = header
         suffix = 2
         while candidate in headers:
