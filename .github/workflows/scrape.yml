@@ -63,10 +63,16 @@ jobs:
 
       - name: Re-run to mop up rate-limited pages
         run: |
+          # Each pass retries the still-missing detail pages after a 429 storm.
+          # --no-excel keeps the intermediate passes cheap: the Scrape step has
+          # already written the workbook, and a later pass rebuilds it if needed.
           for attempt in 1 2 3; do
-            echo "=== mop-up pass $attempt ==="
-            python3 scraper.py --export-only --skip-details || break
+            remaining=$(python3 scraper.py --pending-details | grep -oE '^[0-9]+')
+            echo "mop-up pass $attempt: $remaining detail pages still missing"
+            [ "$remaining" = "0" ] && break
+            python3 scraper.py --export-only --no-excel
           done
+          echo "final remaining: $(python3 scraper.py --pending-details)"
 
       - name: Report essentials coverage
         run: |

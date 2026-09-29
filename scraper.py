@@ -337,9 +337,14 @@ def parse_detail_page(html):
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
+# A 200 whose page carries no ad is a dead/deleted listing, not a transient
+# fault: give up early and cache the failure so it is never fetched again.
+NO_AD_ATTEMPTS = 2
+
 
 def fetch_detail(session, url, timeout, retries, backoff=3):
     last_error = None
+    no_ad_attempts = 0
     for attempt in range(1, retries + 1):
         retry_after = None
         try:
@@ -351,6 +356,9 @@ def fetch_detail(session, url, timeout, retries, backoff=3):
                 if detail is not None:
                     return detail
                 last_error = "no ad data in __NEXT_DATA__"
+                no_ad_attempts += 1
+                if no_ad_attempts >= NO_AD_ATTEMPTS:
+                    return {"error": last_error, "details": {}}
             else:
                 last_error = f"HTTP {resp.status_code}"
                 if resp.status_code in RETRYABLE_STATUS:
@@ -951,6 +959,9 @@ def main():
                         help="fetch at most N uncached detail pages (0 = all)")
     parser.add_argument("--all-categories", action="store_true",
                         help="include non-car ads leaked into the car feed")
+    parser.add_argument("--pending-details", action="store_true",
+                        help="print how many detail pages are still missing, "
+                             "then exit without scraping or exporting")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="verbose logging")
     args = parser.parse_args()
@@ -962,6 +973,11 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.pending_details:
+        missing, total = pending_details(output_dir)
+        print(f"{missing} detail pages missing out of {total} listings")
+        return
 
     if args.fresh:
         pages_dir = output_dir / "pages"
@@ -994,6 +1010,38 @@ def main():
           args.timeout, args.retries, session)
 
     finish(args, output_dir)
+
+
+def pending_details(output_dir):
+    """How many listings still lack a cached detail page."""
+    details_dir = output_dir / "details"
+    records = consolidate_readonly(output_dir)
+    missing = 0
+    for rec in records:
+        list_id = rec.get("list_id")
+        if not rec.get("url") or not list_id:
+            continue
+        if not (details_dir / f"{list_id}.json").exists():
+            missing += 1
+    return missing, len(records)
+
+
+def consolidate_readonly(output_dir, allow_all_categories=False):
+    """Deduplicated listing records without writing any export file."""
+    pages_dir = output_dir / "pages"
+    records = []
+    seen = set()
+    if pages_dir.exists():
+        for path in sorted(pages_dir.glob("page_*.json")):
+            for ad in json.loads(path.read_text(encoding="utf-8")):
+                if not allow_all_categories and not (ad.get("category") or "").startswith("Voitures"):
+                    continue
+                key = ad.get("list_id") or ad.get("url")
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                records.append(ad)
+    return records
 
 
 def finish(args, output_dir):
