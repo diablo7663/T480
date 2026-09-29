@@ -58,7 +58,7 @@ CSV_COLUMNS = [
     "seller_phone_verified", "seller_verified", "is_professional", "is_premium",
     "is_urgent", "is_hot_deal", "is_shop", "is_car_checked", "is_delivery",
     "is_highlighted", "is_immoneuf", "discount", "has_shipping", "is_ecommerce",
-    "default_image", "image_count", "images_json",
+    "default_image", "image_count", "images_json", "price_source", "merged_ads",
 ]
 
 # Detail-page params already exposed by the search page under their own column.
@@ -515,17 +515,30 @@ def save_progress(output_dir, progress):
     )
 
 
-def crawl(base_url, output_dir, max_pages, delay, timeout, retries, session):
+def crawl(base_url, output_dir, max_pages, delay, timeout, retries, session,
+          first_page=0, last_page=0):
+    """Walk the search pages, caching each one.
+
+    first_page/last_page let a scheduled run re-fetch the head of the feed
+    (newest ads first) to pick up new listings without throwing away the rest
+    of the cache.
+    """
     pages_dir = output_dir / "pages"
     pages_dir.mkdir(parents=True, exist_ok=True)
 
     progress = load_progress(output_dir)
     completed = set(progress.get("completed") or [])
-    start_page = (max(completed) if completed else 0) + 1
+    if first_page:
+        start_page = first_page
+    else:
+        start_page = (max(completed) if completed else 0) + 1
     total_listings = progress.get("total_listings")
     ads_per_page = progress.get("ads_per_page")
 
-    upper = max_pages + 1 if max_pages else 1_000_000
+    if last_page:
+        upper = last_page + 1
+    else:
+        upper = max_pages + 1 if max_pages else 1_000_000
     for page in range(start_page, upper):
         url = build_page_url(base_url, page)
         log.info("page %s: fetching %s", page, url)
@@ -577,7 +590,88 @@ def crawl(base_url, output_dir, max_pages, delay, timeout, retries, session):
     return completed
 
 
-def consolidate(output_dir, allow_all_categories=False):
+# A car in Morocco is never sold for 300 DH, and the feed fills the price slot
+# with a placeholder (or a phone number: 0666259012 -> 666259012) whenever a
+# seller says "prix à discuter". Inspecting the extremes showed junk ads
+# ("Khouribga", "Kia Picanto 2010") carrying millions, so anything outside
+# 5 000 - 5 000 000 DH is a placeholder rather than a price.
+PRICE_PLAUSIBLE_MIN = 5_000
+PRICE_PLAUSIBLE_MAX = 5_000_000
+
+# Re-posted ads: dealers re-list the same car, so the same listing shows up
+# many times. Only collapse ads that agree on all of these.
+DUPLICATE_KEY_FIELDS = ("brand", "model", "year", "price", "location",
+                        "seller_id")
+
+
+def _dedup_key(rec):
+    params = rec.get("other_params") or {}
+    parts = []
+    for field in DUPLICATE_KEY_FIELDS:
+        value = params.get(field) if field in ("brand", "model") else rec.get(field)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None  # too little signal to call two ads the same car
+        parts.append(fold(value) if isinstance(value, str) else value)
+    return tuple(parts)
+
+
+def _richness(rec):
+    """How much usable data a row carries, so the best row survives a merge."""
+    params = rec.get("other_params") or {}
+    filled = sum(1 for v in params.values() if v not in (None, "", []))
+    filled += sum(1 for k, v in rec.items()
+                  if v not in (None, "", [], {}) and k != "other_params")
+    return (filled, len(rec.get("images") or []), rec.get("image_count") or 0)
+
+
+def clean_records(records):
+    """Make the export presentable: drop impossible prices, merge re-posts.
+
+    Returns (records, stats). The raw page/detail caches under data/ are never
+    modified, so a dropped row can always be recovered from the source.
+    """
+    stats = {"dropped_bad_price": 0, "merged_ads": 0, "merged_groups": 0}
+
+    plausible = []
+    for rec in records:
+        price = rec.get("price")
+        if isinstance(price, (int, float)) and not (
+                PRICE_PLAUSIBLE_MIN < price < PRICE_PLAUSIBLE_MAX):
+            stats["dropped_bad_price"] += 1
+            continue
+        plausible.append(rec)
+
+    groups = defaultdict(list)
+    ordered = []
+    for rec in plausible:
+        key = _dedup_key(rec)
+        if key is None:
+            rec["merged_ads"] = 1
+            ordered.append(rec)
+            continue
+        groups[key].append(rec)
+        ordered.append(rec)
+
+    dropped = set()
+    for group in groups.values():
+        if len(group) < 2:
+            group[0]["merged_ads"] = 1
+            continue
+        keeper = max(group, key=_richness)
+        keeper["merged_ads"] = len(group)
+        stats["merged_ads"] += len(group) - 1
+        stats["merged_groups"] += 1
+        for rec in group:
+            if rec is not keeper:
+                dropped.add(id(rec))
+
+    cleaned = [rec for rec in ordered
+               if id(rec) not in dropped and rec.get("merged_ads")]
+    stats["total_after_clean"] = len(cleaned)
+    return cleaned, stats
+
+
+def consolidate(output_dir, allow_all_categories=False, stats=None):
     pages_dir = output_dir / "pages"
     records = []
     seen = set()
@@ -597,6 +691,10 @@ def consolidate(output_dir, allow_all_categories=False):
                 records.append(ad)
 
     merged = _merge_details(output_dir, records)
+    records, clean_stats = clean_records(records)
+    if stats is not None:
+        stats.update(clean_stats)
+    stats = stats if stats is not None else clean_stats
 
     json_out = output_dir / "avito_cars.json"
     json_out.write_text(
@@ -618,9 +716,15 @@ def consolidate(output_dir, allow_all_categories=False):
             )
             writer.writerow(row)
 
-    log.info("consolidated %s unique listings (skipped %s duplicates, "
-             "%s merged with a detail page)",
-             len(records), duplicates, merged)
+    log.info("consolidated %s listings (%s exact duplicates skipped, "
+             "%s enriched with a detail page) -> %s after cleaning",
+             len(records) + stats.get("dropped_bad_price", 0)
+             + stats.get("merged_ads", 0),
+             duplicates, merged, len(records))
+    log.info("cleaned: dropped %s rows with an impossible price, "
+             "collapsed %s re-posted ads into %s rows",
+             stats.get("dropped_bad_price", 0),
+             stats.get("merged_ads", 0), stats.get("merged_groups", 0))
     log.info("wrote %s (%s columns)", csv_path, len(columns))
     log.info("wrote %s", json_out)
     return records
@@ -684,6 +788,7 @@ EXCEL_CORE_COLUMNS = [
 
 EXCEL_TAIL_COLUMNS = [
     "location", "city_id", "area_id", "date_posted", "price_source",
+    "merged_ads",
     "seller_id", "seller_type",
     "seller_name", "seller_phone", "seller_phone_verified", "seller_verified",
     "is_professional", "is_premium", "is_urgent", "is_hot_deal", "is_shop",
@@ -692,31 +797,32 @@ EXCEL_TAIL_COLUMNS = [
     "images_json",
 ]
 
+# (label, key, read from other_params, higher is better)
 COMPLETENESS_FIELDS = [
-    ("Titre", "title", False),
-    ("Description", "description", False),
-    ("Prix", "price", False),
-    ("Année", "year", False),
-    ("Kilométrage", "mileage_km", False),
-    ("Carburant", "fuel", False),
-    ("Boîte de vitesses", "gearbox", False),
-    ("Marque", "brand", True),
-    ("Modèle", "model", True),
-    ("Puissance fiscale (CV)", "pfiscale", True),
-    ("Nombre de portes", "doors", True),
-    ("Origine", "v_origin", True),
-    ("État", "auto_condition", True),
-    ("Première main", "first_owner", True),
-    ("Ville", "location", False),
-    ("Téléphone vendeur", "seller_phone", False),
-    ("Photos", "image_count", False),
+    ("Marque", "brand", True, True),
+    ("Modèle", "model", True, True),
+    ("Année", "year", False, True),
+    ("Prix", "price", False, True),
+    ("Titre", "title", False, True),
+    ("Description", "description", False, True),
+    ("Kilométrage", "mileage_km", False, True),
+    ("Carburant", "fuel", False, True),
+    ("Boîte de vitesses", "gearbox", False, True),
+    ("Puissance fiscale (CV)", "pfiscale", True, True),
+    ("Nombre de portes", "doors", True, True),
+    ("Origine", "v_origin", True, True),
+    ("État", "auto_condition", True, True),
+    ("Première main", "first_owner", True, True),
+    ("Ville", "location", False, True),
+    ("Téléphone vendeur", "seller_phone", False, True),
+    ("Photos", "image_count", False, True),
 ]
 
 
 def _completeness(records):
     total = len(records) or 1
     rows = []
-    for label, key, from_params in COMPLETENESS_FIELDS:
+    for label, key, from_params, _ in COMPLETENESS_FIELDS:
         filled = 0
         for rec in records:
             value = ((rec.get("other_params") or {}).get(key)
@@ -726,6 +832,53 @@ def _completeness(records):
             filled += 1
         rows.append([label, filled, f"{100 * filled / total:.1f} %"])
     return rows
+
+
+PRICE_BANDS = [
+    (0, 50_000, "Moins de 50 000 DH"),
+    (50_000, 100_000, "50 000 – 100 000 DH"),
+    (100_000, 150_000, "100 000 – 150 000 DH"),
+    (150_000, 200_000, "150 000 – 200 000 DH"),
+    (200_000, 300_000, "200 000 – 300 000 DH"),
+    (300_000, 500_000, "300 000 – 500 000 DH"),
+    (500_000, None, "Plus de 500 000 DH"),
+]
+
+YEAR_BANDS = [
+    (0, 2000, "Avant 2000"),
+    (2000, 2005, "2000 – 2004"),
+    (2005, 2010, "2005 – 2009"),
+    (2010, 2015, "2010 – 2014"),
+    (2015, 2020, "2015 – 2019"),
+    (2020, None, "2020 et plus"),
+]
+
+
+def _band_counts(records, key, bands):
+    rows = []
+    for low, high, label in bands:
+        count = 0
+        for rec in records:
+            value = rec.get(key)
+            if not isinstance(value, (int, float)):
+                continue
+            if value < low or (high is not None and value >= high):
+                continue
+            count += 1
+        rows.append([label, count])
+    return rows
+
+
+def missing_essentials(rec):
+    """Which of Marque / Modèle / Année / Prix are absent from a row."""
+    params = rec.get("other_params") or {}
+    missing = []
+    for key in ("brand", "model", "year", "price"):
+        value = params.get(key) if key in ("brand", "model") else rec.get(key)
+        if value in (None, "", []):
+            missing.append(EXCEL_ESSENTIAL_LABELS[key])
+    return missing
+
 
 
 
@@ -781,43 +934,53 @@ def _top_counts(records, key, limit=20):
             for label, stats in ordered]
 
 
-def export_excel(records, path):
+def export_excel(records, path, clean_stats=None):
     if not HAS_OPENPYXL:
         log.warning("openpyxl not installed — skipping Excel export "
                     "(pip install openpyxl)")
         return
 
+    clean_stats = clean_stats or {}
     wb = Workbook()
 
     header_fill = PatternFill("solid", fgColor="29A160")
     header_font = Font(color="FFFFFF", bold=True)
     table_fill = PatternFill("solid", fgColor="212B36")
     kpi_font = Font(size=12, bold=True)
+    note_font = Font(size=9, italic=True, color="666666")
 
     summary = wb.active
     summary.title = "Résumé"
     prices = [r["price"] for r in records
               if isinstance(r.get("price"), (int, float))]
+    brands = {(r.get("other_params") or {}).get("brand") for r in records}
+    brands.discard(None)
 
     kpis = [
-        ("Total annonces cars scrappées", len(records)),
+        ("Voitures annoncées", len(records)),
+        ("Annonces regroupées (doublons)", clean_stats.get("merged_ads", 0)),
+        ("Lignes écartées (prix aberrant)", clean_stats.get("dropped_bad_price", 0)),
         ("Prix moyen (DH)", int(statistics.mean(prices)) if prices else None),
         ("Prix médian (DH)", int(statistics.median(prices)) if prices else None),
+        ("Prix mini / maxi (DH)",
+         f"{min(prices):,} / {max(prices):,}".replace(",", " ") if prices else None),
+        ("Annonces avec prix", len(prices)),
         ("Annonces professionnelles", sum(1 for r in records if r.get("is_professional"))),
         ("Annonces particuliers", sum(1 for r in records if not r.get("is_professional"))),
         ("Annonces premium", sum(1 for r in records if r.get("is_premium"))),
+        ("Marques couvertes", len(brands)),
         ("Villes couvertes", len({r.get("location") for r in records
                                   if r.get("location")})),
         ("Date d'export", time.strftime("%Y-%m-%d %H:%M:%S")),
     ]
 
-    summary.cell(1, 1, "AVITO.MA — VOITURES").font = Font(size=16, bold=True)
-    summary.cell(2, 1, "Statistiques sur les annonces collectées").font = kpi_font
+    summary.cell(1, 1, "T480 — Marché des voitures d'occasion (avito.ma)").font = Font(size=16, bold=True)
+    summary.cell(2, 1, "Une ligne par voiture, après nettoyage").font = kpi_font
     for i, (label, value) in enumerate(kpis, start=4):
         summary.cell(i, 1, label).font = kpi_font
         summary.cell(i, 2, value)
-    summary.column_dimensions["A"].width = 30
-    summary.column_dimensions["B"].width = 22
+    summary.column_dimensions["A"].width = 34
+    summary.column_dimensions["B"].width = 24
 
     def add_table(ws, row_start, title, headers, rows):
         ws.cell(row_start, 4, title).font = Font(size=13, bold=True)
@@ -836,22 +999,47 @@ def export_excel(records, path):
 
     rows = add_table(summary, 4, "Villes les plus actives",
                      ["Ville", "Annonces", "Prix moyen (DH)"],
-                     _top_counts(records, "location"))
+                     _top_counts(records, "location", limit=15))
     rows = add_table(summary, rows + 2, "Marques les plus annoncées",
                      ["Marque", "Annonces", "Prix moyen (DH)"],
-                     _top_counts(records, "brand", limit=25))
+                     _top_counts(records, "brand", limit=20))
+    rows = add_table(summary, rows + 2, "Répartition des prix",
+                     ["Tranche de prix", "Annonces"],
+                     _band_counts(records, "price", PRICE_BANDS))
+    rows = add_table(summary, rows + 2, "Répartition des millésimes",
+                     ["Année", "Annonces"],
+                     _band_counts(records, "year", YEAR_BANDS))
     rows = add_table(summary, rows + 2, "Carburant",
                      ["Carburant", "Annonces", "Prix moyen (DH)"],
                      _top_counts(records, "fuel"))
     rows = add_table(summary, rows + 2, "Boîte de vitesses",
                      ["Boîte", "Annonces", "Prix moyen (DH)"],
                      _top_counts(records, "gearbox"))
-    rows = add_table(summary, rows + 2, "Année de mise en circulation",
-                     ["Année", "Annonces", "Prix moyen (DH)"],
-                     _top_counts(records, "year"))
-    add_table(summary, rows + 2, "Complétude des champs",
-              ["Champ", "Remplis", "Complétude"],
-              _completeness(records))
+    rows = add_table(summary, rows + 2, "Complétude des champs",
+                     ["Champ", "Remplis", "Complétude"],
+                     _completeness(records))
+
+    note = summary.cell(rows + 3, 4, "Note methodology")
+    note.font = Font(size=12, bold=True)
+    notes = [
+        "Données extraites des pages de recherche et de fiche annonce d'avito.ma.",
+        "Nettoyage : prix hors 5 000 – 5 000 000 DH ecarte "
+        f"({clean_stats.get('dropped_bad_price', 0)} lignes : prix "
+        "placeholder « a discuter » ou numero de telephone lu comme un prix).",
+        f"Doublons : annonces re-publiees par un meme vendeur pour la meme "
+        f"voiture fusionnees ({clean_stats.get('merged_ads', 0)} annonces "
+        f"reparties sur {clean_stats.get('merged_groups', 0)} groupes). "
+        "La colonne « Annonces regroupees » indique combien d'annonces "
+        "representent chaque ligne.",
+        "Marque, modele et annee proviennent de la fiche annonce ; a defaut, "
+        "ils sont deduits du titre. Le prix est celui affiche par le vendeur ; "
+        "« Origine du prix » precise s'il a ete releve dans le texte.",
+        "Les lignes incompletes sont listees dans l'onglet « A verifier ».",
+        "Les donnees brutes restent disponibles dans le depot (data/cache).",
+    ]
+    for offset, text in enumerate(notes, start=1):
+        cell = summary.cell(rows + 3 + offset, 4, text)
+        cell.font = note_font
 
     data = wb.create_sheet("Annonces")
     taken = set(EXCEL_ESSENTIAL_COLUMNS + EXCEL_IDENTITY_COLUMNS
@@ -921,8 +1109,41 @@ def export_excel(records, path):
     data.freeze_panes = "A2"
     data.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(records) + 1}"
 
+    # Everything a human still has to look at, in one short list.
+    check = wb.create_sheet("À vérifier")
+    check_cols = ["Marque", "Modèle", "Année", "Prix", "Champ(s) manquant(s)",
+                  "Ville", "Vendeur", "Type de vendeur", "Annonces regroupées",
+                  "Lien", "Titre"]
+    for col, header in enumerate(check_cols, start=1):
+        cell = check.cell(1, col, header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(vertical="center")
+        check.column_dimensions[get_column_letter(col)].width = (
+            55 if header == "Lien" else 28 if header == "Titre" else 16)
+
+    flagged = 0
+    for i, rec in enumerate(records, start=2):
+        missing = missing_essentials(rec)
+        if not missing:
+            continue
+        flagged += 1
+        params = rec.get("other_params") or {}
+        values = [params.get("brand"), params.get("model"), rec.get("year"),
+                  rec.get("price"), ", ".join(missing), rec.get("location"),
+                  rec.get("seller_name"), rec.get("seller_type"),
+                  rec.get("merged_ads"), rec.get("url"), rec.get("title")]
+        for col, value in enumerate(values, start=1):
+            cell = check.cell(flagged + 1, col, value)
+            if col == 4 and isinstance(value, (int, float)):
+                cell.number_format = '#,##0 "DH"'
+    check.freeze_panes = "A2"
+    if flagged:
+        check.auto_filter.ref = f"A1:{get_column_letter(len(check_cols))}{flagged + 1}"
+
     wb.save(path)
-    log.info("wrote %s (%s rows x %s columns)", path, len(records), len(columns))
+    log.info("wrote %s (%s rows x %s columns, %s rows to review)",
+             path, len(records), len(columns), flagged)
 
 
 def main():
@@ -943,6 +1164,9 @@ def main():
                         help="retries per page before giving up")
     parser.add_argument("--fresh", action="store_true",
                         help="clear cached pages and start from scratch")
+    parser.add_argument("--refresh-top", type=int, default=0, metavar="N",
+                        help="re-fetch the first N search pages (newest ads) "
+                             "and keep the rest of the cache")
     parser.add_argument("--export-only", action="store_true",
                         help="only rebuild CSV/JSON/Excel from cached pages")
     parser.add_argument("--excel-out", default="avito_cars.xlsx",
@@ -993,6 +1217,14 @@ def main():
 
     session = requests.Session()
     session.headers.update(HEADERS)
+
+    if args.refresh_top:
+        log.info("refreshing the %s first search pages (newest listings)",
+                 args.refresh_top)
+        crawl(args.url, output_dir, 0, args.delay, args.timeout, args.retries,
+              session, first_page=1, last_page=args.refresh_top)
+        finish(args, output_dir)
+        return
 
     progress = load_progress(output_dir)
     if progress.get("finished") and not args.max_pages and not args.fresh:
@@ -1045,15 +1277,19 @@ def consolidate_readonly(output_dir, allow_all_categories=False):
 
 
 def finish(args, output_dir):
-    """Consolidate, enrich with detail pages, then write CSV/JSON/Excel."""
-    records = consolidate(output_dir, allow_all_categories=args.all_categories)
+    """Consolidate, clean, enrich with detail pages, then write the exports."""
+    stats = {}
+    records = consolidate(output_dir,
+                          allow_all_categories=args.all_categories, stats=stats)
     if not args.skip_details:
         crawl_details(records, output_dir, args.timeout, args.retries,
                       args.detail_workers, args.detail_delay,
                       args.max_details)
-        records = consolidate(output_dir, allow_all_categories=args.all_categories)
+        records = consolidate(output_dir,
+                              allow_all_categories=args.all_categories,
+                              stats=stats)
     if not args.no_excel:
-        export_excel(records, output_dir / args.excel_out)
+        export_excel(records, output_dir / args.excel_out, stats)
     return records
 
 

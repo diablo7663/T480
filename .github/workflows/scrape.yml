@@ -1,4 +1,4 @@
-name: Scrape avito.ma
+name: T480 — avito.ma
 
 on:
   workflow_dispatch:
@@ -12,8 +12,13 @@ on:
       max_details:
         description: "Fetch at most N uncached detail pages (0 = all remaining)"
         default: "0"
+      refresh_top:
+        description: "Re-fetch the first N search pages to pick up new ads (0 = skip)"
+        default: "0"
   schedule:
-    # Nightly top-up of fresh listings; the search feed changes constantly.
+    # The feed is sorted newest-first, so refreshing the head of the
+    # pagination collects the day's new listings without re-walking the
+    # whole 891-page crawl.
     - cron: "17 4 * * *"
 
 permissions:
@@ -54,7 +59,19 @@ jobs:
           DETAIL_WORKERS: ${{ inputs.detail_workers || '3' }}
           DETAIL_DELAY: ${{ inputs.detail_delay || '0.5' }}
           MAX_DETAILS: ${{ inputs.max_details || '0' }}
+          REFRESH_TOP: ${{ github.event_name == 'schedule' && '40' || inputs.refresh_top || '0' }}
         run: |
+          # A scheduled run first re-reads the first pages of the search feed
+          # to discover new ads, then fetches the detail pages that are still
+          # missing. A manual run defaults to the cache only.
+          if [ "$REFRESH_TOP" != "0" ]; then
+            python3 scraper.py \
+              --refresh-top "$REFRESH_TOP" \
+              --detail-workers "$DETAIL_WORKERS" \
+              --detail-delay "$DETAIL_DELAY" \
+              --max-details "$MAX_DETAILS" \
+              --no-excel
+          fi
           python3 scraper.py \
             --export-only \
             --detail-workers "$DETAIL_WORKERS" \
@@ -64,14 +81,15 @@ jobs:
       - name: Re-run to mop up rate-limited pages
         run: |
           # Each pass retries the still-missing detail pages after a 429 storm.
-          # --no-excel keeps the intermediate passes cheap: the Scrape step has
-          # already written the workbook, and a later pass rebuilds it if needed.
+          # --no-excel keeps the intermediate passes cheap; the final pass
+          # below rebuilds the workbook from whatever the cache now holds.
           for attempt in 1 2 3; do
             remaining=$(python3 scraper.py --pending-details | grep -oE '^[0-9]+')
             echo "mop-up pass $attempt: $remaining detail pages still missing"
             [ "$remaining" = "0" ] && break
             python3 scraper.py --export-only --no-excel
           done
+          python3 scraper.py --export-only --skip-details
           echo "final remaining: $(python3 scraper.py --pending-details)"
 
       - name: Report essentials coverage
@@ -80,9 +98,8 @@ jobs:
           import json, pathlib
           records = json.loads(pathlib.Path("data/avito_cars.json").read_text())
           total = len(records) or 1
-          with_detail = sum(1 for r in records if r.get("detail_labels"))
-          print(f"listings:            {total}")
-          print(f"with detail page:    {with_detail} ({100 * with_detail / total:.1f} %)")
+          print(f"cleaned listings:    {total}")
+          print(f"collapsed re-posts:  {sum(1 for r in records if r.get('merged_ads', 1) > 1)}")
           for field in ("brand", "model", "year", "price"):
               filled = sum(1 for r in records
                            if (r.get("other_params") or {}).get(field)
@@ -93,7 +110,7 @@ jobs:
       - name: Upload workbook
         uses: actions/upload-artifact@v4
         with:
-          name: avito_cars
+          name: T480-avito-cars
           path: |
             data/avito_cars.xlsx
             data/avito_cars.csv
