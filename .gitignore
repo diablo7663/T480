@@ -8,3 +8,6 @@ data/*.log
 data/avito_cars.json
 data/avito_cars.csv
 data/*.xlsx
+data/sources/
+data/T480_maroc.json
+data/T480_maroc.csv

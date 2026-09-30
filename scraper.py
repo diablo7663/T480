@@ -51,7 +51,8 @@ HEADERS = {
 }
 
 CSV_COLUMNS = [
-    "id", "list_id", "url", "title", "description", "category", "ad_type",
+    "id", "list_id", "url", "title", "source", "description", "category",
+    "ad_type",
     "price", "currency", "monthly_payment", "old_price", "year", "mileage_km",
     "fuel", "gearbox", "other_params_json", "location", "city_id", "area_id",
     "date_posted", "seller_id", "seller_type", "seller_name", "seller_phone",
@@ -598,21 +599,43 @@ def crawl(base_url, output_dir, max_pages, delay, timeout, retries, session,
 PRICE_PLAUSIBLE_MIN = 5_000
 PRICE_PLAUSIBLE_MAX = 5_000_000
 
-# Re-posted ads: dealers re-list the same car, so the same listing shows up
-# many times. Only collapse ads that agree on all of these.
-DUPLICATE_KEY_FIELDS = ("brand", "model", "year", "price", "location",
-                        "seller_id")
-
-
 def _dedup_key(rec):
+    """Key meaning "same car, same seller, same site".
+
+    The site is part of the key so two marketplaces that both list one car
+    stay as two rows (a cross-site report flags them instead of merging).
+    The seller falls back from id to name because only avito exposes an id,
+    and price joins the key only when present: a re-post that hides its price
+    still merges with its priced twin, but two rows with neither seller nor
+    price carry too little signal to call them the same car.
+
+    Mileage is compared exactly: a dealer stocking three identical cars at
+    the same price would otherwise collapse into one, while a re-post copies
+    the same odometer figure verbatim.
+    """
     params = rec.get("other_params") or {}
-    parts = []
-    for field in DUPLICATE_KEY_FIELDS:
+    parts = [fold(str(rec.get("source") or "avito"))]
+    for field in ("brand", "model", "year", "location"):
         value = params.get(field) if field in ("brand", "model") else rec.get(field)
         if value is None or (isinstance(value, str) and not value.strip()):
             return None  # too little signal to call two ads the same car
         parts.append(fold(value) if isinstance(value, str) else value)
+    parts.append(rec.get("mileage_km"))  # None matches only None
+    seller = rec.get("seller_id") or rec.get("seller_name") or ""
+    price = rec.get("price")
+    if not seller and not isinstance(price, (int, float)):
+        return None
+    parts.append(fold(str(seller)) if seller else "")
+    parts.append(price if isinstance(price, (int, float)) else None)
     return tuple(parts)
+
+
+def _base_ads(rec):
+    """Ads a row already stands for (re-cleaning must not reset the count)."""
+    try:
+        return max(1, int(rec.get("merged_ads") or 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _richness(rec):
@@ -646,7 +669,7 @@ def clean_records(records):
     for rec in plausible:
         key = _dedup_key(rec)
         if key is None:
-            rec["merged_ads"] = 1
+            rec["merged_ads"] = _base_ads(rec)
             ordered.append(rec)
             continue
         groups[key].append(rec)
@@ -655,10 +678,10 @@ def clean_records(records):
     dropped = set()
     for group in groups.values():
         if len(group) < 2:
-            group[0]["merged_ads"] = 1
+            group[0]["merged_ads"] = _base_ads(group[0])
             continue
         keeper = max(group, key=_richness)
-        keeper["merged_ads"] = len(group)
+        keeper["merged_ads"] = sum(_base_ads(rec) for rec in group)
         stats["merged_ads"] += len(group) - 1
         stats["merged_groups"] += 1
         for rec in group:
@@ -668,10 +691,19 @@ def clean_records(records):
     cleaned = [rec for rec in ordered
                if id(rec) not in dropped and rec.get("merged_ads")]
     stats["total_after_clean"] = len(cleaned)
+    # Rows collapsed by earlier clean passes count too, so one re-clean of an
+    # already-cleaned export still reports the true number of grouped ads.
+    stats["merged_total"] = sum(_base_ads(rec) for rec in cleaned) - len(cleaned)
     return cleaned, stats
 
 
-def consolidate(output_dir, allow_all_categories=False, stats=None):
+def load_raw_records(output_dir, allow_all_categories=False):
+    """Cached avito search pages, deduplicated and enriched from the cache.
+
+    Returns (records, exact_duplicates, detail_enriched). Every record is
+    tagged with its source, so the multi-source merge can tell sites apart.
+    The raw caches under data/ are never modified.
+    """
     pages_dir = output_dir / "pages"
     records = []
     seen = set()
@@ -688,9 +720,35 @@ def consolidate(output_dir, allow_all_categories=False, stats=None):
                     duplicates += 1
                     continue
                 seen.add(key)
+                ad.setdefault("source", "avito")
                 records.append(ad)
 
     merged = _merge_details(output_dir, records)
+    return records, duplicates, merged
+
+
+def write_csv(records, path):
+    """Write the flat CSV export (one row per car). Returns the column list."""
+    columns = export_columns(records)
+    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=columns)
+        writer.writeheader()
+        for ad in records:
+            params = ad.get("other_params") or {}
+            row = {col: (params[col] if col in params else ad.get(col))
+                   for col in columns}
+            row["images_json"] = json.dumps(ad.get("images") or [],
+                                            ensure_ascii=False)
+            row["other_params_json"] = json.dumps(
+                ad.get("other_params") or {}, ensure_ascii=False
+            )
+            writer.writerow(row)
+    return columns
+
+
+def consolidate(output_dir, allow_all_categories=False, stats=None):
+    records, duplicates, merged = load_raw_records(output_dir,
+                                                   allow_all_categories)
     records, clean_stats = clean_records(records)
     if stats is not None:
         stats.update(clean_stats)
@@ -701,20 +759,8 @@ def consolidate(output_dir, allow_all_categories=False, stats=None):
         json.dumps(records, ensure_ascii=False, indent=1), encoding="utf-8"
     )
 
-    columns = export_columns(records)
     csv_path = output_dir / "avito_cars.csv"
-    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=columns)
-        writer.writeheader()
-        for ad in records:
-            params = ad.get("other_params") or {}
-            row = {col: (params[col] if col in params else ad.get(col))
-                   for col in columns}
-            row["images_json"] = json.dumps(ad.get("images") or [], ensure_ascii=False)
-            row["other_params_json"] = json.dumps(
-                ad.get("other_params") or {}, ensure_ascii=False
-            )
-            writer.writerow(row)
+    columns = write_csv(records, csv_path)
 
     log.info("consolidated %s listings (%s exact duplicates skipped, "
              "%s enriched with a detail page) -> %s after cleaning",
@@ -757,6 +803,7 @@ EXCEL_ESSENTIAL_LABELS = {
 # French headers for the fixed columns, so the whole sheet reads consistently.
 EXCEL_COLUMN_LABELS = {
     "id": "ID", "list_id": "ID annonce", "url": "Lien", "title": "Titre",
+    "source": "Site",
     "description": "Description", "category": "Catégorie",
     "ad_type": "Type d'annonce", "currency": "Devise",
     "monthly_payment": "Mensualité", "old_price": "Ancien prix",
@@ -779,7 +826,7 @@ EXCEL_COLUMN_LABELS = {
     "seller_badges": "Badges", "seller_listings": "Annonces du vendeur",
 }
 
-EXCEL_IDENTITY_COLUMNS = ["id", "list_id", "url", "title"]
+EXCEL_IDENTITY_COLUMNS = ["id", "list_id", "source", "url", "title"]
 
 EXCEL_CORE_COLUMNS = [
     "description", "category", "ad_type", "currency", "monthly_payment",
@@ -934,7 +981,18 @@ def _top_counts(records, key, limit=20):
             for label, stats in ordered]
 
 
-def export_excel(records, path, clean_stats=None):
+SOURCE_LABELS = {
+    "avito": "avito.ma",
+    "kifal": "occasion.kifal.ma",
+    "oneclickdrive": "oneclickdrive.ma",
+}
+
+
+def source_label(source):
+    return SOURCE_LABELS.get(source or "avito", source or "avito")
+
+
+def export_excel(records, path, clean_stats=None, cross_dupes=None):
     if not HAS_OPENPYXL:
         log.warning("openpyxl not installed — skipping Excel export "
                     "(pip install openpyxl)")
@@ -955,10 +1013,14 @@ def export_excel(records, path, clean_stats=None):
               if isinstance(r.get("price"), (int, float))]
     brands = {(r.get("other_params") or {}).get("brand") for r in records}
     brands.discard(None)
+    sources = sorted({r.get("source") or "avito" for r in records})
+    multi_source = len(sources) > 1
 
     kpis = [
         ("Voitures annoncées", len(records)),
-        ("Annonces regroupées (doublons)", clean_stats.get("merged_ads", 0)),
+        ("Sites sources", len(sources)),
+        ("Annonces regroupées (doublons)",
+         clean_stats.get("merged_total", clean_stats.get("merged_ads", 0))),
         ("Lignes écartées (prix aberrant)", clean_stats.get("dropped_bad_price", 0)),
         ("Prix moyen (DH)", int(statistics.mean(prices)) if prices else None),
         ("Prix médian (DH)", int(statistics.median(prices)) if prices else None),
@@ -974,7 +1036,10 @@ def export_excel(records, path, clean_stats=None):
         ("Date d'export", time.strftime("%Y-%m-%d %H:%M:%S")),
     ]
 
-    summary.cell(1, 1, "T480 — Marché des voitures d'occasion (avito.ma)").font = Font(size=16, bold=True)
+    title = (f"T480 — Marché des voitures d'occasion ({source_label(sources[0])})"
+             if not multi_source else
+             "T480 — Marché des voitures d'occasion (Maroc, sources multiples)")
+    summary.cell(1, 1, title).font = Font(size=16, bold=True)
     summary.cell(2, 1, "Une ligne par voiture, après nettoyage").font = kpi_font
     for i, (label, value) in enumerate(kpis, start=4):
         summary.cell(i, 1, label).font = kpi_font
@@ -997,7 +1062,15 @@ def export_excel(records, path, clean_stats=None):
         ws.column_dimensions["G"].width = 14
         return row_start + len(rows)
 
-    rows = add_table(summary, 4, "Villes les plus actives",
+    rows = 4
+    if multi_source:
+        rows = add_table(summary, rows, "Par site",
+                         ["Site", "Annonces", "Prix moyen (DH)"],
+                         [(source_label(source), count, avg)
+                          for source, count, avg
+                          in _top_counts(records, "source", limit=len(sources))])
+        rows += 2
+    rows = add_table(summary, rows, "Villes les plus actives",
                      ["Ville", "Annonces", "Prix moyen (DH)"],
                      _top_counts(records, "location", limit=15))
     rows = add_table(summary, rows + 2, "Marques les plus annoncées",
@@ -1021,8 +1094,10 @@ def export_excel(records, path, clean_stats=None):
 
     note = summary.cell(rows + 3, 4, "Note methodology")
     note.font = Font(size=12, bold=True)
+    source_names = ", ".join(source_label(source) for source in sources)
     notes = [
-        "Données extraites des pages de recherche et de fiche annonce d'avito.ma.",
+        f"Données extraites des pages de recherche et de fiche annonce de "
+        f"{source_names}.",
         "Nettoyage : prix hors 5 000 – 5 000 000 DH ecarte "
         f"({clean_stats.get('dropped_bad_price', 0)} lignes : prix "
         "placeholder « a discuter » ou numero de telephone lu comme un prix).",
@@ -1037,6 +1112,11 @@ def export_excel(records, path, clean_stats=None):
         "Les lignes incompletes sont listees dans l'onglet « A verifier ».",
         "Les donnees brutes restent disponibles dans le depot (data/cache).",
     ]
+    if multi_source:
+        notes.append(
+            "Les doublons ne sont jamais fusionnes d'un site a l'autre : une "
+            "meme voiture annoncee sur deux sites reste deux lignes, signalees "
+            "dans l'onglet « Doublons entre sites ».")
     for offset, text in enumerate(notes, start=1):
         cell = summary.cell(rows + 3 + offset, 4, text)
         cell.font = note_font
@@ -1112,8 +1192,8 @@ def export_excel(records, path, clean_stats=None):
     # Everything a human still has to look at, in one short list.
     check = wb.create_sheet("À vérifier")
     check_cols = ["Marque", "Modèle", "Année", "Prix", "Champ(s) manquant(s)",
-                  "Ville", "Vendeur", "Type de vendeur", "Annonces regroupées",
-                  "Lien", "Titre"]
+                  "Ville", "Site", "Vendeur", "Type de vendeur",
+                  "Annonces regroupées", "Lien", "Titre"]
     for col, header in enumerate(check_cols, start=1):
         cell = check.cell(1, col, header)
         cell.fill = header_fill
@@ -1131,6 +1211,7 @@ def export_excel(records, path, clean_stats=None):
         params = rec.get("other_params") or {}
         values = [params.get("brand"), params.get("model"), rec.get("year"),
                   rec.get("price"), ", ".join(missing), rec.get("location"),
+                  source_label(rec.get("source")),
                   rec.get("seller_name"), rec.get("seller_type"),
                   rec.get("merged_ads"), rec.get("url"), rec.get("title")]
         for col, value in enumerate(values, start=1):
@@ -1140,6 +1221,31 @@ def export_excel(records, path, clean_stats=None):
     check.freeze_panes = "A2"
     if flagged:
         check.auto_filter.ref = f"A1:{get_column_letter(len(check_cols))}{flagged + 1}"
+
+    # One car sold on two sites stays two rows; this sheet is where a human
+    # sees those pairs (never merged automatically).
+    if cross_dupes:
+        cross = wb.create_sheet("Doublons entre sites")
+        cross_cols = ["Marque", "Modèle", "Année", "Prix", "Ville", "Sites",
+                      "Nb annonces", "Vendeurs", "Liens"]
+        widths_cross = {"Liens": 55, "Vendeurs": 34, "Sites": 30}
+        for col, header in enumerate(cross_cols, start=1):
+            cell = cross.cell(1, col, header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(vertical="center")
+            cross.column_dimensions[get_column_letter(col)].width = widths_cross.get(header, 16)
+        for i, row in enumerate(cross_dupes, start=2):
+            values = [row.get(key) for key in
+                      ("brand", "model", "year", "price", "location",
+                       "sites", "count", "sellers", "urls")]
+            for col, value in enumerate(values, start=1):
+                cell = cross.cell(i, col, value)
+                if col == 4 and isinstance(value, (int, float)):
+                    cell.number_format = '#,##0 "DH"'
+        cross.freeze_panes = "A2"
+        cross.auto_filter.ref = (f"A1:{get_column_letter(len(cross_cols))}"
+                                 f"{len(cross_dupes) + 1}")
 
     wb.save(path)
     log.info("wrote %s (%s rows x %s columns, %s rows to review)",
@@ -1260,19 +1366,7 @@ def pending_details(output_dir):
 
 def consolidate_readonly(output_dir, allow_all_categories=False):
     """Deduplicated listing records without writing any export file."""
-    pages_dir = output_dir / "pages"
-    records = []
-    seen = set()
-    if pages_dir.exists():
-        for path in sorted(pages_dir.glob("page_*.json")):
-            for ad in json.loads(path.read_text(encoding="utf-8")):
-                if not allow_all_categories and not (ad.get("category") or "").startswith("Voitures"):
-                    continue
-                key = ad.get("list_id") or ad.get("url")
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                records.append(ad)
+    records, _, _ = load_raw_records(output_dir, allow_all_categories)
     return records
 
 

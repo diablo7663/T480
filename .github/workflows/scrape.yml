@@ -1,4 +1,4 @@
-name: T480 — avito.ma
+name: T480 — voitures d'occasion (Maroc)
 
 on:
   workflow_dispatch:
@@ -15,6 +15,9 @@ on:
       refresh_top:
         description: "Re-fetch the first N search pages to pick up new ads (0 = skip)"
         default: "0"
+      refresh_sources:
+        description: "Re-fetch the head of the other marketplaces' feeds too (0 = skip)"
+        default: "5"
   schedule:
     # The feed is sorted newest-first, so refreshing the head of the
     # pagination collects the day's new listings without re-walking the
@@ -53,6 +56,7 @@ jobs:
           done
           echo "cached pages:   $(ls data/pages 2>/dev/null | wc -l)"
           echo "cached details: $(ls data/details 2>/dev/null | wc -l)"
+          echo "cached sources: $(du -sh data/sources 2>/dev/null || echo none)"
 
       - name: Scrape
         env:
@@ -92,19 +96,51 @@ jobs:
           python3 scraper.py --export-only --skip-details
           echo "final remaining: $(python3 scraper.py --pending-details)"
 
+      - name: Crawl the other Moroccan marketplaces
+        env:
+          REFRESH_SOURCES: ${{ inputs.refresh_sources || '5' }}
+        run: |
+          # occasion.kifal.ma and oneclickdrive.ma: robots.txt permits both,
+          # pages and detail specs are cached under data/sources/, and only
+          # the head of each feed is re-read so new ads still show up.
+          python3 - "$REFRESH_SOURCES" <<'PY'
+          import logging, sys
+          logging.basicConfig(level=logging.INFO,
+                              format="%(asctime)s %(levelname)s %(message)s")
+          top = int(sys.argv[1] or 0)
+          from sources.kifal import crawl as crawl_kifal
+          from sources.oneclickdrive import crawl as crawl_oneclickdrive
+          crawl_kifal("data", refresh_top=top)
+          crawl_oneclickdrive("data", refresh_top=top)
+          PY
+
+      - name: Merge every source into the unified workbook
+        run: python3 merge.py
+
       - name: Report essentials coverage
         run: |
           python3 - <<'PY'
           import json, pathlib
-          records = json.loads(pathlib.Path("data/avito_cars.json").read_text())
-          total = len(records) or 1
-          print(f"cleaned listings:    {total}")
-          print(f"collapsed re-posts:  {sum(1 for r in records if r.get('merged_ads', 1) > 1)}")
-          for field in ("brand", "model", "year", "price"):
-              filled = sum(1 for r in records
-                           if (r.get("other_params") or {}).get(field)
-                           or r.get(field))
-              print(f"{field:20} {filled} ({100 * filled / total:.1f} %)")
+          for name in ("avito_cars.json", "T480_maroc.json"):
+              path = pathlib.Path("data") / name
+              if not path.exists():
+                  continue
+              records = json.loads(path.read_text())
+              total = len(records) or 1
+              print(f"== {name}: {total} rows")
+              if name == "T480_maroc.json":
+                  by_site = {}
+                  for row in records:
+                      site = row.get("source") or "avito"
+                      by_site[site] = by_site.get(site, 0) + 1
+                  for site, count in sorted(by_site.items()):
+                      print(f"   {site:16} {count}")
+              print(f"   collapsed re-posts: {sum(1 for r in records if r.get('merged_ads', 1) > 1)}")
+              for field in ("brand", "model", "year", "price"):
+                  filled = sum(1 for r in records
+                               if (r.get("other_params") or {}).get(field)
+                               or r.get(field))
+                  print(f"   {field:17} {filled} ({100 * filled / total:.1f} %)")
           PY
 
       - name: Upload workbook
@@ -116,12 +152,24 @@ jobs:
             data/avito_cars.csv
           retention-days: 30
 
+      - name: Upload unified workbook
+        uses: actions/upload-artifact@v4
+        with:
+          name: T480-maroc-cars
+          path: |
+            data/T480_maroc.xlsx
+            data/T480_maroc.csv
+          retention-days: 30
+
       - name: Commit cache + exports back
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           tar -czf data/cache/pages.tar.gz -C data pages
           tar -czf data/cache/details.tar.gz -C data details
+          if [ -d data/sources ]; then
+            tar -czf data/cache/sources.tar.gz -C data sources
+          fi
           git add -A data/cache
           if git diff --staged --quiet; then
             echo "cache unchanged"
