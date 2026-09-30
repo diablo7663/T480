@@ -2,13 +2,16 @@
 
 Scraper Python qui transforme les pages de recherche des petites annonces
 marocaines en données structurées, puis en un classeur Excel prêt à analyser.
-Le dépôt couvre trois sites :
+Le dépôt couvre six sites :
 
 | Site | Annonces propres | Mécanisme | robots.txt |
 | --- | --- | --- | --- |
 | **avito.ma** | ~26 900 | payload JSON `__NEXT_DATA__` embarqué dans chaque page | autorisé |
 | **oneclickdrive.ma** | ~6 100 | JSON-LD `ItemList` serveur, 8 villes, 20 annonces/page | autorisé (`Allow: /*?page=`) |
 | **occasion.kifal.ma** | ~400 | cartes serveur + tableau de fiche détaillée | autorisé (`Disallow:` vide) |
+| **wandaloo.com** | ~360 | annonces serveur, pagination `?pg=N`, fiche avec vendeur et téléphone | pas de `robots.txt` publié (page « contenu indisponible ») |
+| **publimaroc.com** | ~190 | annonces serveur, pagination `?page=N`, fiche `.spec-card` (téléphone derrière un compte) | autorisé (`Allow: /`, hors recherche et tris) |
+| **otoclic.com** | ~130 | WordPress, annonces serveur, pagination `/page/N/`, stock de concessions | autorisé (seul `/wp-admin/` interdit) |
 
 Aucun navigateur headless : `requests` + `BeautifulSoup`, poli par hôtes
 (1,5 s minimum entre deux requêtes, backoff `Retry-After`).
@@ -38,11 +41,15 @@ python3 -m pip install -r requirements.txt
 # 1. crawler avito (≈ 28 000 annonces brutes)
 python3 scraper.py
 
-# 2. crawler les autres sites (kifal + oneclickdrive, ≈ 6 600 annonces)
+# 2. crawler les autres sites (kifal, oneclickdrive, wandaloo,
+#    publimaroc, otoclic)
 python3 -c "
 from sources.kifal import crawl as k
 from sources.oneclickdrive import crawl as o
-k('data'); o('data')
+from sources.wandaloo import crawl as w
+from sources.publimaroc import crawl as p
+from sources.otoclic import crawl as t
+k('data'); o('data'); w('data'); p('data'); t('data')
 "
 
 # 3. fusionner, nettoyer et publier le classeur unifié
@@ -119,6 +126,13 @@ terminée : chaque page et chaque fiche sont mises en cache une par une.
   qu'aucune fusion ne traverse deux sites. La colonne **Annonces regroupées**
   indique combien d'annonces représentent chaque ligne ; un export déjà
   nettoyé peut être re-nettoyé sans perdre ce compteur.
+- **Marque, une seule façon de l'écrire** — les sites écrivent la même marque
+  de façons différentes (`VOLKSWAGEN` sur wandaloo, `Volkswagen` sur avito,
+  `Citroen` à côté de `Citroën`, `Mercedes Benz` à côté de `Mercedes-Benz`).
+  La forme la plus fréquente gagne (les sigles courts gardent leurs
+  capitales : `BMW`, `DS`, `MG`), sinon les statistiques de marques seraient
+  coupées en deux. Seul l'affichage change : le rapprochement des annonces
+  plie déjà accents et casse.
 
 Les données brutes ne sont jamais perdues : `data/cache/*.tar.gz` conserve les
 pages et les fiches telles que téléchargées.
@@ -131,7 +145,8 @@ paramètres optionnels (puissance, portes, origine, état, première main,
 carrosserie, couleur, options, photos…). Les colonnes propres à un site
 restent vides sur les autres lignes — jamais inventées.
 
-Les quatre champs essentiels sont renseignés dans cet ordre :
+Les quatre champs essentiels sont renseignés, sur tous les sites, dans cet
+ordre :
 
 1. la fiche annonce (fiable),
 2. déduits du titre (`infer_brand_model`),
@@ -157,6 +172,10 @@ testé (robots.txt + structure) avant décision :
 | `marodrive.ma` | écarté | serveur qui ne répond pas (timeout) |
 | `chad.ma` | écarté | domaine qui ne résout pas |
 | `agenz.ma` | écarté | immobilier uniquement |
+| `leparking.ma` | écarté | HTTP 403 sur tout le site |
+| `goovoiture.ma` | écarté | hébergement coupé (`DEPLOYMENT_DISABLED`) |
+| `autera.ma` | écarté | robots.txt vide, mais seulement 8 annonces actives (API `/api/listings`) |
+| `charito.ma` | écarté | ~6 voitures, abandonné fin 2024 |
 
 Ajouter un site = créer `sources/<site>.py` qui émet des lignes au format
 exact d'avito via `sources/common.make_record()`, puis le laisser tomber dans
@@ -171,7 +190,7 @@ job les décompresse et reprend où le run précédent s'était arrêté.
 - **Lancer maintenant :** Actions → *T480 — voitures d'occasion (Maroc)* →
   *Run workflow* (`detail_workers`, `detail_delay`, `max_details`,
   `refresh_top`, `refresh_sources`).
-- **Nuit :** chaque nuit à 4h17, le run rafraîchit la tête des quatre flux
+- **Nuit :** chaque nuit à 4h17, le run rafraîchit la tête des six flux
   (triés du plus récent au plus ancien) pour récupérer les nouvelles
   annonces, complète les fiches manquantes, puis refait la fusion.
 - Chaque run publie deux artefacts — `T480-avito-cars` et

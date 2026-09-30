@@ -100,9 +100,9 @@ jobs:
         env:
           REFRESH_SOURCES: ${{ inputs.refresh_sources || '5' }}
         run: |
-          # occasion.kifal.ma and oneclickdrive.ma: robots.txt permits both,
-          # pages and detail specs are cached under data/sources/, and only
-          # the head of each feed is re-read so new ads still show up.
+          # Every site in sources/: robots.txt was checked first (or does not
+          # exist), pages and detail specs are cached under data/sources/, and
+          # only the head of each feed is re-read so new ads still show up.
           python3 - "$REFRESH_SOURCES" <<'PY'
           import logging, sys
           logging.basicConfig(level=logging.INFO,
@@ -110,8 +110,14 @@ jobs:
           top = int(sys.argv[1] or 0)
           from sources.kifal import crawl as crawl_kifal
           from sources.oneclickdrive import crawl as crawl_oneclickdrive
+          from sources.wandaloo import crawl as crawl_wandaloo
+          from sources.publimaroc import crawl as crawl_publimaroc
+          from sources.otoclic import crawl as crawl_otoclic
           crawl_kifal("data", refresh_top=top)
           crawl_oneclickdrive("data", refresh_top=top)
+          crawl_wandaloo("data", refresh_top=top)
+          crawl_publimaroc("data", refresh_top=top)
+          crawl_otoclic("data", refresh_top=top)
           PY
 
       - name: Merge every source into the unified workbook

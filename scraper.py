@@ -23,7 +23,7 @@ import statistics
 import threading
 import time
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -98,6 +98,10 @@ BRAND_KEYWORDS = [
 BRAND_DISPLAY = {
     "bmw": "BMW", "ds": "DS", "mg": "MG", "ram": "RAM", "vw": "Volkswagen",
 }
+
+# Marque names the sites write differently but that are the same
+# manufacturer; keys are _brand_key()s (accents/case/separators folded).
+BRAND_ALIASES = {"mercedes": "mercedes benz"}
 
 # Model names made of two words, so "Range Rover" is not cut down to "Range".
 MODEL_PHRASES = ["range rover", "land cruiser", "al mercedes", "series 3"]
@@ -445,13 +449,52 @@ def crawl_details(records, output_dir, timeout, retries, workers, delay,
     return done
 
 
+def fill_essentials(rec):
+    """Last-resort brand, model and price for one listing, from its own text.
+
+    The detail page is authoritative and has already been merged by then;
+    this only falls back to what the title implies and to the price spelled
+    out in the description. Every step is guarded, so running it again on a
+    row that already went through it (avito's cache, then clean_records) is
+    harmless — which is exactly what lets the other sites share it.
+    """
+    params = rec.setdefault("other_params", {})
+    labels = rec.setdefault("detail_labels", {})
+
+    guessed_brand = guessed_model = None
+    if not params.get("brand") or not params.get("model"):
+        guessed_brand, guessed_model = infer_brand_model(rec.get("title"))
+    if not params.get("brand"):
+        candidate = rec.get("brand") or guessed_brand
+        if candidate and candidate != "Inconnu":
+            params["brand"] = candidate
+    labels.setdefault("brand", "Marque")
+    if not params.get("model") and guessed_model:
+        params["model"] = guessed_model
+    if params.get("model"):
+        labels.setdefault("model", "Modèle")
+
+    # Dealers often withhold the price; recover it from the description.
+    if not rec.get("price"):
+        text_price = price_from_text(rec.get("description"))
+        if text_price:
+            rec["price"] = text_price
+            rec["currency"] = rec.get("currency") or "DH"
+            rec["price_source"] = "description"
+    elif not rec.get("price_source"):
+        # Every site that prices its cars shows that price on the listing
+        # itself; only avito details the difference, the others leave the
+        # flag unset on rows parsed before it was introduced.
+        rec["price_source"] = "annonce"
+
+    rec["brand"] = params.get("brand")
+
+
 def _merge_details(output_dir, records):
     """Fold cached detail pages into their listing record."""
     details_dir = output_dir / "details"
     merged = 0
     for rec in records:
-        labels = dict(rec.get("detail_labels") or {})
-        params = dict(rec.get("other_params") or {})
         # "annonce" = listed on the search card, "detail" = only on the ad page.
         rec["price_source"] = "annonce" if rec.get("price") else None
         if details_dir.exists() and rec.get("list_id"):
@@ -463,6 +506,8 @@ def _merge_details(output_dir, records):
                     blob = {}
                 details = blob.get("details")
                 if isinstance(details, dict):
+                    params = rec.setdefault("other_params", {})
+                    labels = rec.setdefault("detail_labels", {})
                     params.update(details)
                     labels.update(blob.get("labels") or {})
                     merged += 1
@@ -476,28 +521,7 @@ def _merge_details(output_dir, records):
                         if blob.get(field) is not None:
                             rec[field] = blob[field]
 
-        # Essentials (brand / model) come from the detail page when available,
-        # otherwise fall back to what the title lets us infer.
-        guessed_brand, guessed_model = infer_brand_model(rec.get("title"))
-        if not params.get("brand"):
-            params["brand"] = rec.get("brand") or guessed_brand
-        labels.setdefault("brand", "Marque")
-        if not params.get("model") and guessed_model:
-            params["model"] = guessed_model
-        if params.get("model"):
-            labels.setdefault("model", "Modèle")
-
-        # Dealers often withhold the price; recover it from the description.
-        if not rec.get("price"):
-            text_price = price_from_text(rec.get("description"))
-            if text_price:
-                rec["price"] = text_price
-                rec["currency"] = rec.get("currency") or "DH"
-                rec["price_source"] = "description"
-
-        rec["brand"] = params["brand"]
-        rec["other_params"] = params
-        rec["detail_labels"] = labels
+        fill_essentials(rec)
     return merged
 
 
@@ -638,6 +662,63 @@ def _base_ads(rec):
         return 1
 
 
+def _brand_form(key, variants):
+    """The written form one marque should use everywhere.
+
+    Short marques keep their capitals (`BMW` beats `Bmw`), everything else
+    drops the shouting (`VOLKSWAGEN` -> `Volkswagen`), and whatever spelling
+    most listings already use wins the rest of the time (`Citroën` over
+    `Citroen`).
+    """
+    acronym = len(key) <= 3
+    return max(variants, key=lambda form: (
+        form.isupper() if acronym else not form.isupper(),
+        variants[form], form))
+
+
+def _brand_key(brand):
+    """Identity of one marque, accents/case/separators aside.
+
+    `Mercedes-Benz`, `Mercedes Benz` and `MERCEDES-BENZ` all come from the
+    same sites; BRAND_ALIASES then folds the few marque names that differ
+    only by how the seller writes them.
+    """
+    key = re.sub(r"[\s\-_]+", " ", fold(brand)).strip()
+    return BRAND_ALIASES.get(key, key)
+
+
+def canonicalize_brands(records):
+    """Rewrite every row's marque to a single, dataset-wide spelling.
+
+    The sites spell the same marque many ways (`VOLKSWAGEN` on wandaloo,
+    `Volkswagen` on avito, `Citroen` next to `Citroën`), which would split
+    the marque statistics in two. The rewrite only touches the display:
+    matching already folds accents and case.
+    """
+    forms = defaultdict(Counter)
+    for rec in records:
+        brand = (rec.get("other_params") or {}).get("brand") or rec.get("brand")
+        if isinstance(brand, str) and brand.strip():
+            forms[_brand_key(brand)][brand] += 1
+    canonical = {key: _brand_form(key, variants)
+                 for key, variants in forms.items()}
+    rewritten = 0
+    for rec in records:
+        params = rec.get("other_params") or {}
+        brand = params.get("brand") or rec.get("brand")
+        if not isinstance(brand, str):
+            continue
+        new = canonical.get(_brand_key(brand))
+        if new and new != brand:
+            params["brand"] = new
+            rec["brand"] = new
+            rewritten += 1
+    if rewritten:
+        log.info("brand spelling unified on %s rows (%s marques)",
+                 rewritten, len(canonical))
+    return rewritten
+
+
 def _richness(rec):
     """How much usable data a row carries, so the best row survives a merge."""
     params = rec.get("other_params") or {}
@@ -654,6 +735,12 @@ def clean_records(records):
     modified, so a dropped row can always be recovered from the source.
     """
     stats = {"dropped_bad_price": 0, "merged_ads": 0, "merged_groups": 0}
+
+    # Every source gets the same treatment: essentials guessed from the text
+    # when the site didn't provide them, then one spelling per marque.
+    for rec in records:
+        fill_essentials(rec)
+    canonicalize_brands(records)
 
     plausible = []
     for rec in records:

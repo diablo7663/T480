@@ -136,6 +136,7 @@ def parse_search(html):
                   if img.get("src")]
 
         energy = card.select_one(".blockHead .blocktext")
+        price = _price(card.select_one("a.price-font-size"))
 
         record = make_record(
             SOURCE, list_id, href,
@@ -143,7 +144,8 @@ def parse_search(html):
             brand=meta.get("product_brand"),
             model=meta.get("product_model"),
             year=year,
-            price=_price(card.select_one("a.price-font-size")),
+            price=price,
+            price_source="annonce" if price else None,
             monthly_payment=_price(card.select_one("a.price-font-size-credit")),
             mileage_km=mileage,
             fuel=fuel,
