@@ -97,6 +97,9 @@ jobs:
           echo "final remaining: $(python3 scraper.py --pending-details)"
 
       - name: Crawl the other Moroccan marketplaces
+        # Five bounded crawls should finish in well under an hour; this
+        # keeps a runaway pagination from eating the whole 350-minute job.
+        timeout-minutes: 90
         env:
           REFRESH_SOURCES: ${{ inputs.refresh_sources || '5' }}
         run: |

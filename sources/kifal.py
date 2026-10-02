@@ -25,6 +25,7 @@ log = logging.getLogger("t480.kifal")
 BASE = "https://occasion.kifal.ma"
 LIST_URL = BASE + "/annonces?page={page}"
 SOURCE = "kifal"
+MAX_PAGES = 150      # the feed is ~40 pages deep; this is a safety net
 
 # Detail-page label -> the field name scraper.py already uses (avito parity).
 FIELD_MAP = {
@@ -220,10 +221,10 @@ def crawl(output_dir, *, max_pages=0, with_details=True, session=None,
     unique: dict[str, dict] = {}
     page = 1
     announced_total = None
+    limit = max_pages or MAX_PAGES
+    stale = 0
 
-    while True:
-        if max_pages and page > max_pages:
-            break
+    while page <= limit:
         cache = pages_dir / f"page_{page:04d}.json"
         cached = None if (refresh_top and page <= refresh_top) else read_json(cache)
         if cached is None:
@@ -247,10 +248,21 @@ def crawl(output_dir, *, max_pages=0, with_details=True, session=None,
             log.info("end of pagination at page %s", page)
             break
 
+        before = len(unique)
         for rec in parsed:
             unique.setdefault(rec["list_id"], rec)
         log.info("page %s: %s listings (unique %s / total %s)", page,
                  len(parsed), len(unique), announced_total or "?")
+        if len(unique) == before:
+            # The site serves pages long after the feed ends (the same ads
+            # over and over, while its own counter claims more exist), so
+            # two dead pages in a row mean there is nothing left to collect.
+            stale += 1
+            if stale >= 2:
+                log.info("no new listings at page %s, stopping", page)
+                break
+        else:
+            stale = 0
         if announced_total and len(unique) >= announced_total:
             break
         page += 1
